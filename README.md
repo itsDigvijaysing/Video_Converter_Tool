@@ -1,12 +1,25 @@
 # VideoTool
 
-A Linux video-conversion and splitting utility with **GUI**, **TUI**, and **CLI** interfaces. Built as a single Python script wrapping `ffmpeg`, designed for converting videos into edit-friendly formats (DNxHR/ProRes) and delivery formats (H.264/H.265 via NVENC), plus splitting long videos into segments without quality loss.
+**A fast, no-nonsense video tool built for Linux** -- because the existing "full-featured" tools on Linux either crash, run slow, have broken UIs, or just don't do what you need them to do. So I built my own.
+
+This is a single Python script wrapping `ffmpeg` that does exactly what I need: **convert**, **split**, **trim**, and **speed-change** videos with proper GPU acceleration, no bloat, and three interfaces (GUI, TUI, CLI) so it works however you prefer.
+
+---
+
+## Why This Exists
+
+Linux has plenty of video tools -- Handbrake, Kdenlive, Shotcut, online converters -- but in practice:
+- Online tools cap you at **2-3 min max** video length
+- GUI tools crash randomly or take forever to configure
+- Most don't properly leverage **NVIDIA NVENC** for fast exports
+- Simple tasks like "split this 10-min video into 2-min parts" require way too many steps
+- Speed changes and quick trims shouldn't need a full NLE timeline
+
+VideoTool fixes all of this. One script, fast GPU encoding, splits/trims in seconds with zero quality loss, and it just works.
 
 ---
 
 ## Screenshots
-
-<!-- Add your screenshots here -->
 
 | GUI - System Detection | GUI - Convert Tab |
 |:---:|:---:|
@@ -16,18 +29,37 @@ A Linux video-conversion and splitting utility with **GUI**, **TUI**, and **CLI*
 |:---:|:---:|
 | ![Progress](screenshots/PROGRESS.png) | ![Split Tab](screenshots/SPLIT.png) |
 
+<!-- Add new screenshots here as you take them -->
+<!-- | GUI - Edit Tab | TUI |  -->
+<!-- |:---:|:---:| -->
+<!-- | ![Edit Tab](screenshots/EDIT.png) | ![TUI](screenshots/TUI.png) | -->
+
 ---
 
 ## Features
 
+### Core
 - **7 Conversion Presets** -- DNxHR HQ/SQ, ProRes HQ, H.264/H.265 NVENC, Stream Copy, Audio PCM
-- **Video Splitter** -- Cut videos into equal segments by max duration (no re-encode, zero quality loss)
-- **NVIDIA GPU Auto-Detection** -- Detects NVENC, uses GPU encoding when available, falls back to CPU
+- **Video Splitter** -- Split videos into equal segments by max duration (M:SS input, no re-encode, zero quality loss, near-instant)
+- **Video Trimmer** -- Cut a portion of video by start/end time, stream copy (fast) or re-encode (frame-accurate)
+- **Speed Changer** -- 0.25x to 100x playback speed with proper audio pitch correction
+
+### Speed & GPU
+- **NVIDIA NVENC Auto-Detection** -- Detects your GPU, uses hardware encoding when available, auto-falls back to CPU
 - **Real-Time GPU Monitoring** -- Live GPU utilization and memory usage during encoding
-- **Batch Processing** -- Process entire folders of videos at once
-- **Three Interfaces** -- Full-featured GUI (PyQt5/PySide6), TUI (curses), and CLI
-- **Dry Run Mode** -- Preview ffmpeg commands before executing
+- **Stream Copy Operations** -- Split and trim use `-c copy` by default: no re-encoding means **instant results with zero quality loss**
+- **Batch Processing** -- Drop a folder, convert everything in one go
+
+### Interfaces
+- **GUI** (PyQt5/PySide6) -- Full-featured with 6 tabs: Detection, Convert, Progress, History, Split/Cut, Edit
+- **TUI** (curses) -- Terminal UI for SSH/headless use with all features
+- **CLI** (argparse) -- Scriptable commands for automation and pipelines
+
+### Extras
+- **Dry Run Mode** -- Preview exact ffmpeg commands before executing
 - **Job Reports** -- Export conversion history as JSON or CSV
+- **Video Thumbnail Preview** -- Edit tab shows video thumbnail + opens in system player
+- **Duration input as M:SS** -- No confusing decimal minutes, type `1:30` for 1 min 30 sec
 
 ---
 
@@ -46,6 +78,7 @@ flowchart TB
         PRE["Presets &<br/>Command Builder"]
         JOB["Job Runner<br/>Progress Parsing"]
         SPL["Video Splitter<br/>(stream copy)"]
+        EDT["Trim & Speed<br/>(copy or re-encode)"]
         GPU["GPU Monitor<br/>(pynvml / nvidia-smi)"]
     end
 
@@ -66,11 +99,16 @@ flowchart TB
     TUI --> SPL
     GUI --> SPL
 
+    CLI --> EDT
+    TUI --> EDT
+    GUI --> EDT
+
     DET --> FF
     DET --> NV
     PRE --> JOB
     JOB --> FF
     SPL --> FF
+    EDT --> FF
     GPU --> NV
     GUI --> GPU
     TUI --> GPU
@@ -100,6 +138,22 @@ flowchart LR
     C --> D["N segments"]
     D --> E["Loop: ffmpeg<br/>-ss START -t LEN<br/>-c copy"]
     E --> F["part_001, part_002,<br/>..., part_N"]
+```
+
+### Edit Flow (Trim / Speed)
+
+```mermaid
+flowchart LR
+    A["Input Video"] --> B{"Operation?"}
+    B -->|Trim| C["ffmpeg -ss START<br/>-t DURATION"]
+    B -->|Speed| D["ffmpeg -filter:v setpts<br/>-filter:a atempo"]
+    C --> E{"Mode?"}
+    E -->|Stream copy| F["-c copy<br/>(fast, keyframe-aligned)"]
+    E -->|Re-encode| G["-c:v libx264<br/>(frame-accurate)"]
+    D --> H["Re-encode required"]
+    F --> I["Output"]
+    G --> I
+    H --> I
 ```
 
 ### Preset Decision Tree
@@ -134,7 +188,7 @@ flowchart TD
 | Dependency | Required | Purpose |
 |:---|:---:|:---|
 | Python 3.10+ | Yes | Runtime |
-| ffmpeg | Yes | Video encoding/splitting |
+| ffmpeg | Yes | Video encoding/splitting/trimming |
 | PyQt5 or PySide6 | No | GUI mode |
 | pynvml | No | Better GPU monitoring |
 | psutil | No | System resource info |
@@ -167,7 +221,7 @@ chmod +x videotool.py
 ./videotool.py gui        # Explicit GUI launch
 ```
 
-**Tabs:** System/Detection | Convert | Progress | History | Split/Cut
+**Tabs:** System/Detection | Convert | Progress | History | Split/Cut | Edit
 
 ### TUI (Terminal UI)
 
@@ -180,12 +234,13 @@ chmod +x videotool.py
 |:---:|:---|
 | `C` | Convert screen |
 | `S` | Split screen |
+| `E` | Edit screen (Trim / Speed) |
 | `H` | Job history |
 | `D` | Save detection JSON |
 | `Q` | Quit |
 | `I` | Set input file/folder |
 | `O` | Set output directory |
-| `Up/Down` | Change preset or split duration |
+| `Up/Down` | Change preset, duration, or speed |
 | `Enter` | Start operation |
 | `Esc` | Back to main |
 
@@ -212,16 +267,47 @@ chmod +x videotool.py
 ### CLI -- Split
 
 ```bash
-# Split a 10-min video into 2-min segments
-./videotool.py split -i long_video.mp4 -d 2
+# Split a 10-min video into 2-min segments (use M:SS format)
+./videotool.py split -i long_video.mp4 -d 2:00
+
+# 1 min 30 sec segments
+./videotool.py split -i long_video.mp4 -d 1:30
 
 # Split with custom output directory
-./videotool.py split -i long_video.mp4 -d 3 -O /output/parts/
+./videotool.py split -i long_video.mp4 -d 3:00 -O /output/parts/
 ```
 
 **Output:** `long_video_part001.mp4`, `long_video_part002.mp4`, ..., `long_video_part005.mp4`
 
-> Split uses stream copy (`-c copy`) so there is **no re-encoding** and **no quality loss**. It's near-instant.
+> Split uses stream copy (`-c copy`) -- **no re-encoding, zero quality loss, near-instant**.
+
+### CLI -- Trim
+
+```bash
+# Trim from 1:30 to 3:00 (stream copy, fast)
+./videotool.py trim -i video.mp4 -s 1:30 -e 3:00
+
+# Trim with re-encode for frame-accurate cuts
+./videotool.py trim -i video.mp4 -s 0:45 -e 2:15 --reencode
+
+# Custom output path
+./videotool.py trim -i video.mp4 -s 0:00 -e 1:00 -o first_minute.mp4
+```
+
+### CLI -- Speed
+
+```bash
+# 2x speed
+./videotool.py speed -i video.mp4 -x 2.0
+
+# Slow motion (half speed)
+./videotool.py speed -i video.mp4 -x 0.5
+
+# 4x speed with custom output
+./videotool.py speed -i video.mp4 -x 4.0 -o fast_version.mp4
+```
+
+> Speed change requires re-encoding. Audio pitch is corrected automatically via chained `atempo` filters.
 
 ### CLI -- Detect
 
@@ -249,7 +335,7 @@ chmod +x videotool.py
 
 ```
 Video_Converter_Tool/
-├── videotool.py          # Single-file application (~2190 lines)
+├── videotool.py          # Single-file application (~2920 lines)
 ├── requirements.txt      # Python dependencies
 ├── README.md
 ├── llm_memory.md         # Compressed project knowledge for LLM context
@@ -259,6 +345,8 @@ Video_Converter_Tool/
     ├── PROGRESS.png      # GUI - Progress Tab
     └── SPLIT.png         # GUI - Split / Cut Tab
 ```
+
+> Take more screenshots? Drop them in `screenshots/` and add rows to the Screenshots table above.
 
 ---
 

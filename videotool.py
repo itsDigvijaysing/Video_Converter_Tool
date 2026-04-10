@@ -67,16 +67,13 @@ except ImportError:
     pass
 
 _HAS_QT = False
-_QT_BINDING = None
 try:
     from PyQt5 import QtWidgets, QtCore, QtGui
     _HAS_QT = True
-    _QT_BINDING = "PyQt5"
 except ImportError:
     try:
         from PySide6 import QtWidgets, QtCore, QtGui
         _HAS_QT = True
-        _QT_BINDING = "PySide6"
     except ImportError:
         pass
 
@@ -779,6 +776,36 @@ class JobRunner:
 # SECTION 4B: VIDEO SPLITTER
 # ═══════════════════════════════════════════════════════════════════════════
 
+def format_seconds(s: float) -> str:
+    """Format seconds as M:SS or H:MM:SS."""
+    s = max(0, s)
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
+def parse_duration_input(text: str) -> float:
+    """Parse duration from 'M:SS', 'H:MM:SS', or plain seconds/minutes. Returns seconds."""
+    text = text.strip()
+    if ":" in text:
+        parts = text.split(":")
+        try:
+            if len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            pass
+        return -1
+    try:
+        return float(text)
+    except ValueError:
+        return -1
+
+
 @dataclass
 class SplitResult:
     input_path: str = ""
@@ -792,13 +819,13 @@ class SplitResult:
 
 def split_video(
     input_path: str,
-    max_segment_minutes: float,
+    max_segment_seconds: float,
     output_dir: str = "",
     ffmpeg_path: str = "",
     on_segment_done: Optional[callable] = None,
 ) -> SplitResult:
     """
-    Split a video into segments of max_segment_minutes length using stream copy (no re-encode).
+    Split a video into segments of max_segment_seconds length using stream copy (no re-encode).
     Returns SplitResult with list of output files.
     """
     result = SplitResult(input_path=input_path)
@@ -820,13 +847,13 @@ def split_video(
         return result
 
     result.total_duration_s = total_dur
-    segment_s = max_segment_minutes * 60.0
+    segment_s = max_segment_seconds
     result.segment_duration_s = segment_s
 
     if segment_s >= total_dur:
         result.errors.append(
-            f"Segment length ({max_segment_minutes:.1f} min) >= video duration "
-            f"({total_dur / 60:.1f} min). No splitting needed."
+            f"Segment length ({format_seconds(segment_s)}) >= video duration "
+            f"({format_seconds(total_dur)}). No splitting needed."
         )
         result.status = "failed"
         return result
@@ -881,6 +908,154 @@ def split_video(
         result.status = "completed"
 
     log.info(f"Split complete: {len(result.output_files)}/{num_segments} segments OK")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4C: TRIM & SPEED
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class EditResult:
+    input_path: str = ""
+    output_path: str = ""
+    status: str = "pending"  # pending, running, completed, failed
+    error: str = ""
+    duration_s: float = 0.0
+
+
+def trim_video(
+    input_path: str,
+    start_s: float,
+    end_s: float,
+    output_path: str = "",
+    stream_copy: bool = True,
+    ffmpeg_path: str = "",
+) -> EditResult:
+    """
+    Trim video from start_s to end_s.
+    stream_copy=True uses -c copy (fast, keyframe-aligned).
+    stream_copy=False re-encodes (frame-accurate).
+    """
+    result = EditResult(input_path=input_path)
+    result.status = "running"
+    ffmpeg = ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+    inp = pathlib.Path(input_path)
+
+    if not inp.is_file():
+        result.error = f"Input file not found: {input_path}"
+        result.status = "failed"
+        return result
+
+    if end_s <= start_s:
+        result.error = f"End time ({format_seconds(end_s)}) must be after start ({format_seconds(start_s)})."
+        result.status = "failed"
+        return result
+
+    if not output_path:
+        output_path = str(inp.parent / f"{inp.stem}_trimmed{inp.suffix}")
+    result.output_path = output_path
+
+    duration = end_s - start_s
+    cmd = [ffmpeg, "-y", "-ss", str(start_s), "-i", input_path, "-t", str(duration)]
+    if stream_copy:
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k"]
+    cmd.append(output_path)
+
+    log.info(f"Trimming: {shlex.join(cmd)}")
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        result.duration_s = time.time() - t0
+        if proc.returncode == 0:
+            result.status = "completed"
+        else:
+            result.status = "failed"
+            result.error = proc.stderr[-500:] if proc.stderr else "Unknown error"
+    except subprocess.TimeoutExpired:
+        result.status = "failed"
+        result.error = "Trim timed out"
+    except Exception as e:
+        result.status = "failed"
+        result.error = str(e)
+
+    return result
+
+
+def change_speed(
+    input_path: str,
+    speed: float,
+    output_path: str = "",
+    ffmpeg_path: str = "",
+) -> EditResult:
+    """
+    Change video playback speed.
+    speed=2.0 means 2x faster, 0.5 means half speed.
+    Requires re-encoding.
+    """
+    result = EditResult(input_path=input_path)
+    result.status = "running"
+    ffmpeg = ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+    inp = pathlib.Path(input_path)
+
+    if not inp.is_file():
+        result.error = f"Input file not found: {input_path}"
+        result.status = "failed"
+        return result
+
+    if speed <= 0 or speed > 100:
+        result.error = f"Invalid speed: {speed}. Must be between 0.01 and 100."
+        result.status = "failed"
+        return result
+
+    if not output_path:
+        tag = f"{speed:.1f}x".replace(".", "_")
+        output_path = str(inp.parent / f"{inp.stem}_{tag}{inp.suffix}")
+    result.output_path = output_path
+
+    # Video: setpts=PTS/speed (e.g. 2x -> 0.5*PTS)
+    video_filter = f"setpts={1.0/speed:.4f}*PTS"
+
+    # Audio: atempo only supports 0.5-100.0 range; chain multiple for extremes
+    atempo_filters = []
+    remaining = speed
+    while remaining > 2.0:
+        atempo_filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        atempo_filters.append("atempo=0.5")
+        remaining /= 0.5
+    atempo_filters.append(f"atempo={remaining:.4f}")
+    audio_filter = ",".join(atempo_filters)
+
+    cmd = [
+        ffmpeg, "-y", "-i", input_path,
+        "-filter:v", video_filter,
+        "-filter:a", audio_filter,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        output_path,
+    ]
+
+    log.info(f"Speed change ({speed}x): {shlex.join(cmd)}")
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result.duration_s = time.time() - t0
+        if proc.returncode == 0:
+            result.status = "completed"
+        else:
+            result.status = "failed"
+            result.error = proc.stderr[-500:] if proc.stderr else "Unknown error"
+    except subprocess.TimeoutExpired:
+        result.status = "failed"
+        result.error = "Speed change timed out"
+    except Exception as e:
+        result.status = "failed"
+        result.error = str(e)
+
     return result
 
 
@@ -1010,13 +1185,19 @@ def cli_split(args) -> int:
         print(f"ERROR: ffmpeg not found. {caps.ffmpeg.errors}", file=sys.stderr)
         return 1
 
+    # Parse duration: accept "M:SS", "H:MM:SS", or plain seconds
+    seg_seconds = parse_duration_input(args.duration)
+    if seg_seconds <= 0:
+        print(f"ERROR: Invalid duration '{args.duration}'. Use M:SS, H:MM:SS, or seconds.", file=sys.stderr)
+        return 1
+
     def on_segment(part, total, path):
         print(f"  [{part}/{total}] {pathlib.Path(path).name}")
 
-    print(f"Splitting: {args.input} (max {args.duration} min per segment)")
+    print(f"Splitting: {args.input} (max {format_seconds(seg_seconds)} per segment)")
     result = split_video(
         input_path=args.input,
-        max_segment_minutes=args.duration,
+        max_segment_seconds=seg_seconds,
         output_dir=args.output_dir or "",
         ffmpeg_path=caps.ffmpeg.path,
         on_segment_done=on_segment,
@@ -1029,6 +1210,64 @@ def cli_split(args) -> int:
     else:
         print(f"\nFailed: {'; '.join(result.errors)}", file=sys.stderr)
 
+    return 0 if result.status == "completed" else 1
+
+
+def cli_trim(args) -> int:
+    """Trim video from CLI."""
+    caps = detect_system(args.ffmpeg or "")
+    if not caps.ffmpeg.found:
+        print(f"ERROR: ffmpeg not found. {caps.ffmpeg.errors}", file=sys.stderr)
+        return 1
+
+    start_s = parse_duration_input(args.start)
+    if start_s < 0:
+        print(f"ERROR: Invalid start time '{args.start}'. Use M:SS, H:MM:SS, or seconds.", file=sys.stderr)
+        return 1
+    end_s = parse_duration_input(args.end)
+    if end_s < 0:
+        print(f"ERROR: Invalid end time '{args.end}'. Use M:SS, H:MM:SS, or seconds.", file=sys.stderr)
+        return 1
+
+    stream_copy = not args.reencode
+    mode = "re-encode" if args.reencode else "stream copy"
+    print(f"Trimming: {args.input} [{format_seconds(start_s)} -> {format_seconds(end_s)}] ({mode})")
+
+    result = trim_video(
+        input_path=args.input,
+        start_s=start_s,
+        end_s=end_s,
+        output_path=args.output or "",
+        stream_copy=stream_copy,
+        ffmpeg_path=caps.ffmpeg.path,
+    )
+
+    if result.status == "completed":
+        print(f"Done! Output: {result.output_path} ({result.duration_s:.1f}s)")
+    else:
+        print(f"Failed: {result.error}", file=sys.stderr)
+    return 0 if result.status == "completed" else 1
+
+
+def cli_speed(args) -> int:
+    """Change video speed from CLI."""
+    caps = detect_system(args.ffmpeg or "")
+    if not caps.ffmpeg.found:
+        print(f"ERROR: ffmpeg not found. {caps.ffmpeg.errors}", file=sys.stderr)
+        return 1
+
+    print(f"Changing speed: {args.input} -> {args.speed}x")
+    result = change_speed(
+        input_path=args.input,
+        speed=args.speed,
+        output_path=args.output or "",
+        ffmpeg_path=caps.ffmpeg.path,
+    )
+
+    if result.status == "completed":
+        print(f"Done! Output: {result.output_path} ({result.duration_s:.1f}s)")
+    else:
+        print(f"Failed: {result.error}", file=sys.stderr)
     return 0 if result.status == "completed" else 1
 
 
@@ -1045,7 +1284,7 @@ class TUI:
         self.caps = detect_system(ffmpeg_path)
         self.runner = JobRunner(self.caps)
         self.gpu_mon = GPUMonitor() if self.caps.gpu.nvidia_smi_ok else None
-        self.screen = "main"  # main, convert, progress, history, split
+        self.screen = "main"  # main, convert, progress, history, split, edit
         self.input_files: list[str] = []
         self.output_dir = ""
         self.selected_preset = 0
@@ -1056,9 +1295,18 @@ class TUI:
         # Split state
         self.split_input: str = ""
         self.split_output_dir: str = ""
-        self.split_duration_min: float = 2.0
+        self.split_duration_s: float = 120.0  # 2 min in seconds
         self.split_result: Optional[SplitResult] = None
         self._split_running = False
+        # Edit state
+        self.edit_input: str = ""
+        self.edit_start_s: float = 0.0
+        self.edit_end_s: float = 0.0
+        self.edit_speed: float = 1.0
+        self.edit_mode: int = 0  # 0=trim, 1=speed
+        self.edit_stream_copy: bool = True
+        self._edit_result: Optional[EditResult] = None
+        self._edit_running = False
 
     def run(self):
         curses.curs_set(0)
@@ -1088,6 +1336,8 @@ class TUI:
                     self._draw_history(h, w)
                 elif self.screen == "split":
                     self._draw_split(h, w)
+                elif self.screen == "edit":
+                    self._draw_edit(h, w)
             except curses.error:
                 pass
             self.stdscr.refresh()
@@ -1158,7 +1408,7 @@ class TUI:
         y += 2
         self._safe_addstr(y, 2, "Navigation", curses.A_BOLD)
         y += 1
-        self._safe_addstr(y, 4, "[C] Convert  [S] Split Video  [H] History  [D] Detect (JSON)  [Q] Quit")
+        self._safe_addstr(y, 4, "[C] Convert  [S] Split  [E] Edit (Trim/Speed)  [H] History  [D] Detect  [Q] Quit")
 
         if self.message:
             self._safe_addstr(h - 2, 2, self.message[:w - 4], curses.color_pair(3))
@@ -1268,15 +1518,15 @@ class TUI:
         y += 1
         self._safe_addstr(y, 4, f"Output dir: {self.split_output_dir or '(same as input — press O to set)'}")
         y += 1
-        self._safe_addstr(y, 4, f"Max segment length: {self.split_duration_min:.1f} min  (Up/Down to change, or press L to type)")
+        self._safe_addstr(y, 4, f"Max segment length: {format_seconds(self.split_duration_s)}  (Up/Down +-10s, or press L to type M:SS)")
         y += 2
 
         if self.split_input:
             dur = _probe_duration(self.caps.ffmpeg.path, self.split_input)
             if dur > 0:
                 import math
-                num_parts = math.ceil(dur / (self.split_duration_min * 60))
-                self._safe_addstr(y, 4, f"Video duration: {dur / 60:.1f} min", curses.color_pair(4))
+                num_parts = math.ceil(dur / self.split_duration_s)
+                self._safe_addstr(y, 4, f"Video duration: {format_seconds(dur)}", curses.color_pair(4))
                 y += 1
                 self._safe_addstr(y, 4, f"Will create: {num_parts} segment(s)", curses.color_pair(4))
                 y += 1
@@ -1324,6 +1574,8 @@ class TUI:
                 self.screen = "convert"
             elif key == ord('s') or key == ord('S'):
                 self.screen = "split"
+            elif key == ord('e') or key == ord('E'):
+                self.screen = "edit"
             elif key == ord('h') or key == ord('H'):
                 self.screen = "history"
             elif key == ord('d') or key == ord('D'):
@@ -1369,13 +1621,35 @@ class TUI:
             elif key == ord('o') or key == ord('O'):
                 self._input_prompt("Output directory: ", self._set_split_output_dir)
             elif key == ord('l') or key == ord('L'):
-                self._input_prompt("Max segment length (minutes): ", self._set_split_duration)
+                self._input_prompt("Max segment length (M:SS or seconds): ", self._set_split_duration)
             elif key == curses.KEY_UP:
-                self.split_duration_min = min(60.0, self.split_duration_min + 0.5)
+                self.split_duration_s = min(3600.0, self.split_duration_s + 10)
             elif key == curses.KEY_DOWN:
-                self.split_duration_min = max(0.5, self.split_duration_min - 0.5)
+                self.split_duration_s = max(10.0, self.split_duration_s - 10)
             elif key in (10, curses.KEY_ENTER):
                 self._start_split()
+
+        elif self.screen == "edit":
+            if key == ord('i') or key == ord('I'):
+                self._input_prompt("Input video file: ", self._set_edit_input)
+            elif key == ord('m') or key == ord('M'):
+                self.edit_mode = (self.edit_mode + 1) % 2
+            elif key == ord('a') or key == ord('A'):
+                self._input_prompt("Start time (M:SS or seconds): ", self._set_edit_start)
+            elif key == ord('b') or key == ord('B'):
+                self._input_prompt("End time (M:SS or seconds): ", self._set_edit_end)
+            elif key == ord('x') or key == ord('X'):
+                self._input_prompt("Speed multiplier (e.g. 2.0): ", self._set_edit_speed)
+            elif key == ord('t') or key == ord('T'):
+                self.edit_stream_copy = not self.edit_stream_copy
+            elif key == curses.KEY_UP:
+                if self.edit_mode == 1:
+                    self.edit_speed = min(100.0, self.edit_speed + 0.25)
+            elif key == curses.KEY_DOWN:
+                if self.edit_mode == 1:
+                    self.edit_speed = max(0.25, self.edit_speed - 0.25)
+            elif key in (10, curses.KEY_ENTER):
+                self._start_edit()
 
     def _input_prompt(self, prompt: str, callback):
         """Simple text input at bottom of screen."""
@@ -1473,15 +1747,12 @@ class TUI:
             self.message = f"Invalid directory: {path}"
 
     def _set_split_duration(self, val: str):
-        try:
-            d = float(val)
-            if d > 0:
-                self.split_duration_min = d
-                self.message = f"Segment length: {d:.1f} min"
-            else:
-                self.message = "Duration must be > 0"
-        except ValueError:
-            self.message = "Invalid number"
+        d = parse_duration_input(val)
+        if d > 0:
+            self.split_duration_s = d
+            self.message = f"Segment length: {format_seconds(d)}"
+        else:
+            self.message = "Invalid duration. Use M:SS or seconds."
 
     def _start_split(self):
         if not self.split_input:
@@ -1498,7 +1769,7 @@ class TUI:
         def _do_split():
             self.split_result = split_video(
                 input_path=self.split_input,
-                max_segment_minutes=self.split_duration_min,
+                max_segment_seconds=self.split_duration_s,
                 output_dir=self.split_output_dir,
                 ffmpeg_path=self.caps.ffmpeg.path,
             )
@@ -1509,6 +1780,147 @@ class TUI:
                 self.message = "Split failed — see errors"
 
         threading.Thread(target=_do_split, daemon=True).start()
+
+    # --- Edit screen helpers ---
+
+    def _draw_edit(self, h: int, w: int):
+        self._draw_header(w)
+        y = 2
+        self._safe_addstr(y, 2, "Edit Video (Trim / Speed)", curses.A_BOLD)
+        y += 2
+
+        self._safe_addstr(y, 4, f"Input: {self.edit_input or '(none — press I)'}")
+        y += 1
+
+        if self.edit_input:
+            dur = _probe_duration(self.caps.ffmpeg.path, self.edit_input)
+            if dur > 0:
+                self._safe_addstr(y, 4, f"Video duration: {format_seconds(dur)}", curses.color_pair(4))
+                y += 1
+        y += 1
+
+        modes = ["TRIM", "SPEED"]
+        mode_str = "  ".join(
+            f"[{m}]" if i == self.edit_mode else f" {m} "
+            for i, m in enumerate(modes)
+        )
+        self._safe_addstr(y, 4, f"Mode (M to toggle): {mode_str}", curses.A_BOLD)
+        y += 2
+
+        if self.edit_mode == 0:
+            self._safe_addstr(y, 4, f"Start: {format_seconds(self.edit_start_s)}  (press A to set)")
+            y += 1
+            self._safe_addstr(y, 4, f"End:   {format_seconds(self.edit_end_s)}  (press B to set)")
+            y += 1
+            copy_str = "stream copy (fast)" if self.edit_stream_copy else "re-encode (precise)"
+            self._safe_addstr(y, 4, f"Method: {copy_str}  (press T to toggle)")
+            y += 1
+        else:
+            self._safe_addstr(y, 4, f"Speed: {self.edit_speed:.2f}x  (Up/Down +-0.25, or press X to type)")
+            y += 1
+            self._safe_addstr(y, 4, "(Re-encoding required for speed change)")
+            y += 1
+
+        y += 1
+        if self._edit_running:
+            self._safe_addstr(y, 4, "Processing...", curses.color_pair(3))
+            y += 1
+        elif self._edit_result:
+            r = self._edit_result
+            if r.status == "completed":
+                self._safe_addstr(y, 4, f"Done! Output: {pathlib.Path(r.output_path).name}", curses.color_pair(1))
+                y += 1
+                self._safe_addstr(y, 4, f"Took {r.duration_s:.1f}s", curses.color_pair(1))
+            else:
+                self._safe_addstr(y, 4, f"Failed: {r.error[:w - 14]}", curses.color_pair(2))
+
+        self._safe_addstr(h - 2, 2, "[I] Input  [M] Mode  [A] Start  [B] End  [X] Speed  [T] Copy/Re-enc  [Enter] Go  [Esc] Back")
+        if self.message:
+            self._safe_addstr(h - 3, 2, self.message[:w - 4], curses.color_pair(3))
+
+    def _set_edit_input(self, path: str):
+        p = pathlib.Path(path)
+        if p.is_file():
+            self.edit_input = str(p)
+            self._edit_result = None
+            dur = _probe_duration(self.caps.ffmpeg.path, str(p))
+            if dur > 0:
+                self.edit_end_s = dur
+                self.edit_start_s = 0.0
+            self.message = f"Edit input: {p.name}"
+        else:
+            self.message = f"File not found: {path}"
+
+    def _set_edit_start(self, val: str):
+        s = parse_duration_input(val)
+        if s >= 0:
+            self.edit_start_s = s
+            self.message = f"Start: {format_seconds(s)}"
+        else:
+            self.message = "Invalid time. Use M:SS or seconds."
+
+    def _set_edit_end(self, val: str):
+        s = parse_duration_input(val)
+        if s >= 0:
+            self.edit_end_s = s
+            self.message = f"End: {format_seconds(s)}"
+        else:
+            self.message = "Invalid time. Use M:SS or seconds."
+
+    def _set_edit_speed(self, val: str):
+        try:
+            sp = float(val)
+            if 0.25 <= sp <= 100:
+                self.edit_speed = sp
+                self.message = f"Speed: {sp:.2f}x"
+            else:
+                self.message = "Speed must be 0.25 - 100"
+        except ValueError:
+            self.message = "Invalid number"
+
+    def _start_edit(self):
+        if not self.edit_input:
+            self.message = "Set input file first (press I)"
+            return
+        if self._edit_running:
+            self.message = "Already processing"
+            return
+
+        self._edit_running = True
+        self._edit_result = None
+
+        if self.edit_mode == 0:
+            self.message = f"Trimming {format_seconds(self.edit_start_s)} -> {format_seconds(self.edit_end_s)}..."
+
+            def _do():
+                self._edit_result = trim_video(
+                    input_path=self.edit_input,
+                    start_s=self.edit_start_s,
+                    end_s=self.edit_end_s,
+                    stream_copy=self.edit_stream_copy,
+                    ffmpeg_path=self.caps.ffmpeg.path,
+                )
+                self._edit_running = False
+                if self._edit_result.status == "completed":
+                    self.message = f"Trim done! {pathlib.Path(self._edit_result.output_path).name}"
+                else:
+                    self.message = "Trim failed"
+        else:
+            self.message = f"Changing speed to {self.edit_speed:.2f}x..."
+
+            def _do():
+                self._edit_result = change_speed(
+                    input_path=self.edit_input,
+                    speed=self.edit_speed,
+                    ffmpeg_path=self.caps.ffmpeg.path,
+                )
+                self._edit_running = False
+                if self._edit_result.status == "completed":
+                    self.message = f"Speed done! {pathlib.Path(self._edit_result.output_path).name}"
+                else:
+                    self.message = "Speed change failed"
+
+        threading.Thread(target=_do, daemon=True).start()
 
 
 def run_tui(ffmpeg_path: str = ""):
@@ -1751,22 +2163,29 @@ if _HAS_QT:
             split_out_row.addWidget(btn_split_out)
             split_layout.addLayout(split_out_row)
 
-            # Duration selector
+            # Duration selector — minutes + seconds
             dur_row = QtWidgets.QHBoxLayout()
             dur_row.addWidget(QtWidgets.QLabel("Max segment length:"))
-            self.split_duration_spin = QtWidgets.QDoubleSpinBox()
-            self.split_duration_spin.setRange(0.5, 120.0)
-            self.split_duration_spin.setValue(2.0)
-            self.split_duration_spin.setSingleStep(0.5)
-            self.split_duration_spin.setSuffix(" min")
-            self.split_duration_spin.valueChanged.connect(self._update_split_preview)
-            dur_row.addWidget(self.split_duration_spin)
+            self.split_min_spin = QtWidgets.QSpinBox()
+            self.split_min_spin.setRange(0, 120)
+            self.split_min_spin.setValue(2)
+            self.split_min_spin.setSuffix(" min")
+            self.split_min_spin.valueChanged.connect(self._update_split_preview)
+            dur_row.addWidget(self.split_min_spin)
+            self.split_sec_spin = QtWidgets.QSpinBox()
+            self.split_sec_spin.setRange(0, 59)
+            self.split_sec_spin.setValue(0)
+            self.split_sec_spin.setSuffix(" sec")
+            self.split_sec_spin.valueChanged.connect(self._update_split_preview)
+            dur_row.addWidget(self.split_sec_spin)
 
             # Quick-select buttons
-            for mins in [1, 2, 3, 5, 10]:
-                btn = QtWidgets.QPushButton(f"{mins} min")
-                btn.setFixedWidth(60)
-                btn.clicked.connect(lambda checked, m=mins: self.split_duration_spin.setValue(m))
+            for label, m, s in [("1:00", 1, 0), ("2:00", 2, 0), ("3:00", 3, 0),
+                                ("5:00", 5, 0), ("10:00", 10, 0), ("1:30", 1, 30), ("2:30", 2, 30)]:
+                btn = QtWidgets.QPushButton(label)
+                btn.setFixedWidth(55)
+                btn.clicked.connect(lambda checked, mm=m, ss=s: (
+                    self.split_min_spin.setValue(mm), self.split_sec_spin.setValue(ss)))
                 dur_row.addWidget(btn)
             dur_row.addStretch()
             split_layout.addLayout(dur_row)
@@ -1792,6 +2211,133 @@ if _HAS_QT:
             split_layout.addWidget(self.split_log)
 
             self.tabs.addTab(split_widget, "Split / Cut")
+
+            # --- Edit tab (Trim + Speed + Video Preview) ---
+            edit_widget = QtWidgets.QWidget()
+            edit_layout = QtWidgets.QVBoxLayout(edit_widget)
+
+            # Input row
+            edit_in_row = QtWidgets.QHBoxLayout()
+            edit_in_row.addWidget(QtWidgets.QLabel("Input Video:"))
+            self.edit_input_edit = QtWidgets.QLineEdit()
+            edit_in_row.addWidget(self.edit_input_edit)
+            btn_edit_file = QtWidgets.QPushButton("Browse...")
+            btn_edit_file.clicked.connect(self._pick_edit_input)
+            edit_in_row.addWidget(btn_edit_file)
+            edit_layout.addLayout(edit_in_row)
+
+            # Output row
+            edit_out_row = QtWidgets.QHBoxLayout()
+            edit_out_row.addWidget(QtWidgets.QLabel("Output:"))
+            self.edit_output_edit = QtWidgets.QLineEdit()
+            self.edit_output_edit.setPlaceholderText("(auto-generated if empty)")
+            edit_out_row.addWidget(self.edit_output_edit)
+            btn_edit_out = QtWidgets.QPushButton("Browse...")
+            btn_edit_out.clicked.connect(self._pick_edit_output)
+            edit_out_row.addWidget(btn_edit_out)
+            edit_layout.addLayout(edit_out_row)
+
+            # --- Video Preview (thumbnail + external player) ---
+            preview_frame = QtWidgets.QFrame()
+            preview_frame.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel)
+            preview_lay = QtWidgets.QVBoxLayout(preview_frame)
+            preview_lay.setContentsMargins(4, 4, 4, 4)
+
+            self._thumb_label = QtWidgets.QLabel("No video loaded")
+            self._thumb_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self._thumb_label.setMinimumHeight(200)
+            self._thumb_label.setStyleSheet("background: #1a1a1a; color: #888; font-size: 14px;")
+            preview_lay.addWidget(self._thumb_label)
+
+            self._video_info_label = QtWidgets.QLabel("")
+            self._video_info_label.setStyleSheet("color: #0088cc; font-weight: bold;")
+            preview_lay.addWidget(self._video_info_label)
+
+            preview_btn_row = QtWidgets.QHBoxLayout()
+            btn_open_player = QtWidgets.QPushButton("Open in System Player")
+            btn_open_player.clicked.connect(self._open_in_system_player)
+            preview_btn_row.addWidget(btn_open_player)
+            preview_btn_row.addStretch()
+            preview_lay.addLayout(preview_btn_row)
+
+            edit_layout.addWidget(preview_frame)
+
+            # --- Trim controls ---
+            trim_group = QtWidgets.QGroupBox("Trim")
+            trim_lay = QtWidgets.QHBoxLayout(trim_group)
+
+            trim_lay.addWidget(QtWidgets.QLabel("Start:"))
+            self.trim_start_min = QtWidgets.QSpinBox()
+            self.trim_start_min.setRange(0, 999)
+            self.trim_start_min.setSuffix(" m")
+            trim_lay.addWidget(self.trim_start_min)
+            self.trim_start_sec = QtWidgets.QSpinBox()
+            self.trim_start_sec.setRange(0, 59)
+            self.trim_start_sec.setSuffix(" s")
+            trim_lay.addWidget(self.trim_start_sec)
+
+            trim_lay.addWidget(QtWidgets.QLabel("  End:"))
+            self.trim_end_min = QtWidgets.QSpinBox()
+            self.trim_end_min.setRange(0, 999)
+            self.trim_end_min.setSuffix(" m")
+            trim_lay.addWidget(self.trim_end_min)
+            self.trim_end_sec = QtWidgets.QSpinBox()
+            self.trim_end_sec.setRange(0, 59)
+            self.trim_end_sec.setSuffix(" s")
+            trim_lay.addWidget(self.trim_end_sec)
+
+            self.trim_copy_radio = QtWidgets.QRadioButton("Stream copy (fast)")
+            self.trim_copy_radio.setChecked(True)
+            trim_lay.addWidget(self.trim_copy_radio)
+            self.trim_reencode_radio = QtWidgets.QRadioButton("Re-encode (precise)")
+            trim_lay.addWidget(self.trim_reencode_radio)
+
+            btn_trim = QtWidgets.QPushButton("Trim")
+            btn_trim.setStyleSheet("font-weight: bold;")
+            btn_trim.clicked.connect(self._do_trim)
+            trim_lay.addWidget(btn_trim)
+            trim_lay.addStretch()
+            edit_layout.addWidget(trim_group)
+
+            # --- Speed controls ---
+            speed_group = QtWidgets.QGroupBox("Speed")
+            speed_lay = QtWidgets.QHBoxLayout(speed_group)
+
+            speed_lay.addWidget(QtWidgets.QLabel("Playback speed:"))
+            self.speed_combo = QtWidgets.QComboBox()
+            for label, val in [("0.25x", 0.25), ("0.5x", 0.5), ("0.75x", 0.75),
+                               ("1.0x (normal)", 1.0), ("1.25x", 1.25), ("1.5x", 1.5),
+                               ("2.0x", 2.0), ("3.0x", 3.0), ("4.0x", 4.0)]:
+                self.speed_combo.addItem(label, val)
+            self.speed_combo.setCurrentIndex(3)  # 1.0x default
+            speed_lay.addWidget(self.speed_combo)
+
+            speed_lay.addWidget(QtWidgets.QLabel("  or custom:"))
+            self.speed_custom = QtWidgets.QDoubleSpinBox()
+            self.speed_custom.setRange(0.25, 100.0)
+            self.speed_custom.setValue(1.0)
+            self.speed_custom.setSingleStep(0.25)
+            self.speed_custom.setSuffix("x")
+            speed_lay.addWidget(self.speed_custom)
+
+            self.speed_use_custom = QtWidgets.QCheckBox("Use custom")
+            speed_lay.addWidget(self.speed_use_custom)
+
+            btn_speed = QtWidgets.QPushButton("Change Speed")
+            btn_speed.setStyleSheet("font-weight: bold;")
+            btn_speed.clicked.connect(self._do_speed)
+            speed_lay.addWidget(btn_speed)
+            speed_lay.addStretch()
+            edit_layout.addWidget(speed_group)
+
+            # Edit log
+            self.edit_log = QtWidgets.QTextEdit()
+            self.edit_log.setReadOnly(True)
+            self.edit_log.setFont(QtGui.QFont("Monospace", 10))
+            self.edit_log.setMaximumHeight(120)
+            edit_layout.addWidget(self.edit_log)
+
+            self.tabs.addTab(edit_widget, "Edit")
 
             # Status bar
             self.statusBar().showMessage("Ready")
@@ -2007,8 +2553,15 @@ if _HAS_QT:
             if folder:
                 self.split_output_edit.setText(folder)
 
+        def _get_split_seconds(self) -> float:
+            return self.split_min_spin.value() * 60 + self.split_sec_spin.value()
+
         def _update_split_preview(self):
             path = self.split_input_edit.text().strip()
+            seg_s = self._get_split_seconds()
+            if seg_s <= 0:
+                self.split_preview_label.setText("Set a segment length > 0.")
+                return
             if not path or not pathlib.Path(path).is_file():
                 self.split_preview_label.setText("")
                 return
@@ -2018,10 +2571,9 @@ if _HAS_QT:
                 self.split_preview_label.setText("Could not read video duration.")
                 return
             import math
-            seg_s = self.split_duration_spin.value() * 60.0
             num = math.ceil(dur / seg_s)
             self.split_preview_label.setText(
-                f"Video: {dur / 60:.1f} min  |  Segment: {self.split_duration_spin.value():.1f} min  |  "
+                f"Video: {format_seconds(dur)}  |  Segment: {format_seconds(seg_s)}  |  "
                 f"Will create {num} part(s)"
             )
 
@@ -2031,12 +2583,15 @@ if _HAS_QT:
                 QtWidgets.QMessageBox.warning(self, "No Input", "Select a video file to split.")
                 return
 
-            seg_min = self.split_duration_spin.value()
+            seg_s = self._get_split_seconds()
+            if seg_s <= 0:
+                QtWidgets.QMessageBox.warning(self, "Invalid Duration", "Set a segment length > 0.")
+                return
             out_dir = self.split_output_edit.text().strip()
 
             self.split_log.clear()
             self.split_log.append(f"Splitting: {path}")
-            self.split_log.append(f"Max segment: {seg_min:.1f} min")
+            self.split_log.append(f"Max segment: {format_seconds(seg_s)}")
             self.split_log.append("Working...\n")
             self.statusBar().showMessage("Splitting video...")
             self._split_result = None
@@ -2056,7 +2611,7 @@ if _HAS_QT:
 
                 self._split_result = split_video(
                     input_path=path,
-                    max_segment_minutes=seg_min,
+                    max_segment_seconds=seg_s,
                     output_dir=out_dir,
                     ffmpeg_path=self.caps.ffmpeg.path,
                     on_segment_done=on_seg,
@@ -2083,10 +2638,162 @@ if _HAS_QT:
                     self.split_log.append(f"  {e}")
                 self.statusBar().showMessage("Split failed")
 
+        # --- Edit tab methods ---
+
+        def _pick_edit_input(self):
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select video to edit", "",
+                "Video Files (*.mp4 *.mkv *.mov *.avi *.mxf *.ts *.webm *.flv);;All Files (*)"
+            )
+            if path:
+                self.edit_input_edit.setText(path)
+                self._load_video_preview(path)
+
+        def _pick_edit_output(self):
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save edited video", "",
+                "Video Files (*.mp4 *.mkv *.mov);;All Files (*)"
+            )
+            if path:
+                self.edit_output_edit.setText(path)
+
+        def _load_video_preview(self, path: str):
+            """Generate thumbnail and show video info."""
+            ffmpeg = self.ffmpeg_path or self.caps.ffmpeg.path or "ffmpeg"
+            dur = _probe_duration(ffmpeg, path)
+
+            # Auto-set end time from duration
+            if dur > 0:
+                self.trim_end_min.setValue(int(dur // 60))
+                self.trim_end_sec.setValue(int(dur % 60))
+                self.trim_start_min.setValue(0)
+                self.trim_start_sec.setValue(0)
+                self._video_info_label.setText(
+                    f"Duration: {format_seconds(dur)}  |  File: {pathlib.Path(path).name}"
+                )
+            else:
+                self._video_info_label.setText(f"File: {pathlib.Path(path).name}")
+
+            # Generate thumbnail at 10% into video
+            try:
+                seek_pos = max(1, dur * 0.1) if dur > 0 else 1
+                thumb_path = str(pathlib.Path(LOG_DIR) / "_thumb.jpg")
+                cmd = [
+                    ffmpeg, "-y", "-ss", str(seek_pos),
+                    "-i", path, "-vframes", "1",
+                    "-vf", "scale=480:-1",
+                    thumb_path,
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=10)
+                if pathlib.Path(thumb_path).exists():
+                    pixmap = QtGui.QPixmap(thumb_path)
+                    if not pixmap.isNull():
+                        scaled = pixmap.scaled(
+                            self._thumb_label.width(), 280,
+                            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                            QtCore.Qt.TransformationMode.SmoothTransformation,
+                        )
+                        self._thumb_label.setPixmap(scaled)
+                    else:
+                        self._thumb_label.setText("Could not load thumbnail")
+                else:
+                    self._thumb_label.setText("Could not generate thumbnail")
+            except Exception as e:
+                self._thumb_label.setText(f"Thumbnail error: {e}")
+                log.warning(f"Thumbnail generation failed: {e}")
+
+        def _open_in_system_player(self):
+            """Open video in the system's default video player."""
+            path = self.edit_input_edit.text().strip()
+            if not path or not pathlib.Path(path).is_file():
+                self.statusBar().showMessage("No video file loaded")
+                return
+            try:
+                subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.statusBar().showMessage(f"Opened in system player: {pathlib.Path(path).name}")
+            except Exception as e:
+                self.statusBar().showMessage(f"Could not open player: {e}")
+
+        def _do_trim(self):
+            path = self.edit_input_edit.text().strip()
+            if not path:
+                QtWidgets.QMessageBox.warning(self, "No Input", "Select a video file.")
+                return
+            start_s = self.trim_start_min.value() * 60 + self.trim_start_sec.value()
+            end_s = self.trim_end_min.value() * 60 + self.trim_end_sec.value()
+            output = self.edit_output_edit.text().strip()
+            stream_copy = self.trim_copy_radio.isChecked()
+
+            self.edit_log.clear()
+            self.edit_log.append(f"Trimming: {format_seconds(start_s)} -> {format_seconds(end_s)}")
+            self.edit_log.append(f"Mode: {'stream copy' if stream_copy else 're-encode'}")
+            self.edit_log.append("Working...")
+            self.statusBar().showMessage("Trimming video...")
+            self._edit_result = None
+
+            self._edit_poll_timer = QtCore.QTimer(self)
+            self._edit_poll_timer.timeout.connect(self._check_edit_done)
+            self._edit_poll_timer.start(500)
+
+            def _do():
+                self._edit_result = trim_video(
+                    input_path=path,
+                    start_s=start_s,
+                    end_s=end_s,
+                    output_path=output,
+                    stream_copy=stream_copy,
+                    ffmpeg_path=self.caps.ffmpeg.path,
+                )
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        def _do_speed(self):
+            path = self.edit_input_edit.text().strip()
+            if not path:
+                QtWidgets.QMessageBox.warning(self, "No Input", "Select a video file.")
+                return
+            if self.speed_use_custom.isChecked():
+                speed = self.speed_custom.value()
+            else:
+                speed = self.speed_combo.currentData()
+            output = self.edit_output_edit.text().strip()
+
+            self.edit_log.clear()
+            self.edit_log.append(f"Changing speed to {speed:.2f}x")
+            self.edit_log.append("Working... (re-encoding required)")
+            self.statusBar().showMessage(f"Changing speed to {speed}x...")
+            self._edit_result = None
+
+            self._edit_poll_timer = QtCore.QTimer(self)
+            self._edit_poll_timer.timeout.connect(self._check_edit_done)
+            self._edit_poll_timer.start(500)
+
+            def _do():
+                self._edit_result = change_speed(
+                    input_path=path,
+                    speed=speed,
+                    output_path=output,
+                    ffmpeg_path=self.caps.ffmpeg.path,
+                )
+
+            threading.Thread(target=_do, daemon=True).start()
+
+        def _check_edit_done(self):
+            result = self._edit_result
+            if result is None:
+                return
+            self._edit_poll_timer.stop()
+            if result.status == "completed":
+                self.edit_log.append(f"\nDone! Output: {result.output_path}")
+                self.edit_log.append(f"Took {result.duration_s:.1f}s")
+                self.statusBar().showMessage(f"Edit complete: {pathlib.Path(result.output_path).name}")
+            else:
+                self.edit_log.append(f"\nFailed: {result.error}")
+                self.statusBar().showMessage("Edit failed")
+
         def closeEvent(self, event):
             if self.gpu_mon:
                 self.gpu_mon.stop()
-            # Cancel running jobs
             for jid, job in self.runner.jobs.items():
                 if job.status == JobStatus.RUNNING:
                     self.runner.cancel_job(jid)
@@ -2163,9 +2870,27 @@ def build_parser() -> argparse.ArgumentParser:
     # split
     sp = sub.add_parser("split", help="Split video into segments by max duration")
     sp.add_argument("-i", "--input", required=True, help="Input video file")
-    sp.add_argument("-d", "--duration", type=float, required=True,
-                    help="Max segment length in minutes (e.g. 2, 3, 5)")
+    sp.add_argument("-d", "--duration", required=True,
+                    help="Max segment length as M:SS, H:MM:SS, or seconds (e.g. 2:00, 1:30, 90)")
     sp.add_argument("-O", "--output-dir", help="Output directory (default: same as input)")
+
+    # trim
+    tr = sub.add_parser("trim", help="Trim video by start/end time")
+    tr.add_argument("-i", "--input", required=True, help="Input video file")
+    tr.add_argument("-s", "--start", required=True,
+                    help="Start time as M:SS, H:MM:SS, or seconds (e.g. 1:30, 90)")
+    tr.add_argument("-e", "--end", required=True,
+                    help="End time as M:SS, H:MM:SS, or seconds (e.g. 3:00, 180)")
+    tr.add_argument("-o", "--output", help="Output file (default: auto-generated)")
+    tr.add_argument("--reencode", action="store_true",
+                    help="Re-encode for frame-accurate trim (default: stream copy)")
+
+    # speed
+    spd = sub.add_parser("speed", help="Change video playback speed")
+    spd.add_argument("-i", "--input", required=True, help="Input video file")
+    spd.add_argument("-x", "--speed", type=float, required=True,
+                     help="Speed multiplier (e.g. 2.0 for 2x, 0.5 for half)")
+    spd.add_argument("-o", "--output", help="Output file (default: auto-generated)")
 
     return parser
 
@@ -2185,6 +2910,10 @@ def main():
         sys.exit(cli_convert(args))
     elif args.command == "split":
         sys.exit(cli_split(args))
+    elif args.command == "trim":
+        sys.exit(cli_trim(args))
+    elif args.command == "speed":
+        sys.exit(cli_speed(args))
     else:
         parser.print_help()
 
