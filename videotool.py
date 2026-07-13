@@ -251,6 +251,7 @@ def detect_system(ffmpeg_path: str = "") -> SystemCapabilities:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class Preset(enum.Enum):
+    DNXHR_LB = "dnxhr_lb"
     DNXHR_HQ = "dnxhr_hq"
     DNXHR_SQ = "dnxhr_sq"
     PRORES_HQ = "prores_hq"
@@ -260,6 +261,11 @@ class Preset(enum.Enum):
     AUDIO_PCM = "audio_pcm"
 
 PRESET_INFO = {
+    Preset.DNXHR_LB: {
+        "label": "DNxHR LB (.mov) — ★ Recommended: smallest Resolve-friendly",
+        "container": "mov",
+        "gpu": False,
+    },
     Preset.DNXHR_HQ: {
         "label": "DNxHR HQ (.mov) — Edit-friendly for Resolve",
         "container": "mov",
@@ -297,13 +303,23 @@ PRESET_INFO = {
     },
 }
 
+# CPU-encoded intermediate/mezzanine presets (DNxHR, ProRes). These have no
+# hardware encoder, but the source can still be decoded on the GPU (CUDA/NVDEC)
+# to speed up the read side while the encode stays on CPU.
+INTERMEDIATE_PRESETS = frozenset({
+    Preset.DNXHR_LB,
+    Preset.DNXHR_SQ,
+    Preset.DNXHR_HQ,
+    Preset.PRORES_HQ,
+})
+
 
 @dataclass
 class ConvertOptions:
     """All options for a single conversion job."""
     input_path: str = ""
     output_path: str = ""
-    preset: Preset = Preset.DNXHR_HQ
+    preset: Preset = Preset.DNXHR_LB
     container: str = ""  # override container
     use_hwaccel: bool = True
     gpu_index: int = 0
@@ -337,17 +353,42 @@ def build_ffmpeg_command(
     needs_gpu = info["gpu"]
     nvenc_ok = caps.nvenc_available
 
+    # GPU decode availability (CUDA/NVDEC): NVIDIA present + ffmpeg has cuda hwaccel.
+    # Independent of NVENC — decode works even when no NVENC encoder is detected.
+    cuda_decode_ok = (
+        opts.use_hwaccel
+        and caps.gpu.nvidia_smi_ok
+        and "cuda" in caps.gpu.hwaccels
+    )
+
     # Hardware accel input
     if needs_gpu and opts.use_hwaccel and nvenc_ok:
+        # NVENC presets: decode on GPU, encode on GPU.
         cmd += ["-hwaccel", "cuda"]
         if opts.gpu_index:
             cmd += ["-hwaccel_device", str(opts.gpu_index)]
+    elif preset in INTERMEDIATE_PRESETS and cuda_decode_ok:
+        # DNxHR/ProRes: decode on GPU, encode on CPU. No -hwaccel_output_format
+        # cuda, so frames download to system memory for the software encoder
+        # (also keeps the -vf scale override working). Unsupported source codecs
+        # fall back to software decode automatically.
+        cmd += ["-hwaccel", "cuda"]
+        if opts.gpu_index:
+            cmd += ["-hwaccel_device", str(opts.gpu_index)]
+        warnings.append("GPU decode via CUDA enabled; DNxHR/ProRes encode runs on CPU.")
 
     # Input
     cmd += ["-i", opts.input_path]
 
     # Build codec args per preset
-    if preset == Preset.DNXHR_HQ:
+    if preset == Preset.DNXHR_LB:
+        cmd += ["-map", "0", "-c:v", "dnxhd", "-profile:v", "dnxhr_lb",
+                "-pix_fmt", opts.pixel_format or "yuv422p"]
+        if opts.fps:
+            cmd += ["-r", opts.fps]
+        cmd += ["-c:a", opts.audio_codec or "pcm_s16le"]
+
+    elif preset == Preset.DNXHR_HQ:
         cmd += ["-map", "0", "-c:v", "dnxhd", "-profile:v", "dnxhr_hq",
                 "-pix_fmt", opts.pixel_format or "yuv422p"]
         if opts.fps:
@@ -403,7 +444,7 @@ def build_ffmpeg_command(
     # Advanced overrides
     if opts.resolution:
         cmd += ["-vf", f"scale={opts.resolution.replace('x', ':')}"]
-    if opts.fps and preset not in (Preset.DNXHR_HQ,):
+    if opts.fps and preset not in (Preset.DNXHR_LB, Preset.DNXHR_HQ):
         cmd += ["-r", opts.fps]
 
     # Extra args
@@ -2849,9 +2890,9 @@ def build_parser() -> argparse.ArgumentParser:
     conv.add_argument("-i", "--input", required=True, help="Input file or folder")
     conv.add_argument("-o", "--output", help="Output file (single-file mode)")
     conv.add_argument("-O", "--output-dir", help="Output directory (batch mode)")
-    conv.add_argument("-p", "--preset", default="dnxhr_hq",
+    conv.add_argument("-p", "--preset", default="dnxhr_lb",
                       choices=[p.value for p in Preset],
-                      help="Conversion preset (default: dnxhr_hq)")
+                      help="Conversion preset (default: dnxhr_lb — smallest Resolve-friendly)")
     conv.add_argument("--template", default="{basename}_{preset}.{ext}",
                       help="Output filename template")
     conv.add_argument("--dry-run", action="store_true", help="Show commands without running")
